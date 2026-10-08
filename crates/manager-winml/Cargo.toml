@@ -1,0 +1,11 @@
+[package]
+name = "manager-winml"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+manager-config = { path = "../manager-config" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }

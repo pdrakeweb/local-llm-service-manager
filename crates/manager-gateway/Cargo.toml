@@ -1,0 +1,10 @@
+[package]
+name = "manager-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+manager-config = { path = "../manager-config" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
