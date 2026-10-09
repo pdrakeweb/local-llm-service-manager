@@ -16,7 +16,7 @@
     ]
   },
   "build": {
-    "beforeBuildCommand": "npm run build --prefix ../ui",
+    "beforeBuildCommand": "",
     "beforeDevCommand": "npm run dev --prefix ../ui",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
