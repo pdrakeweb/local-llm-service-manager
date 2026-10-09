@@ -39,7 +39,6 @@
         "languages": [
           "English"
         ],
-        "license": "../LICENSE",
         "minimumWebview2Version": "120.0.2210.61",
         "startMenuFolder": "Local LLM Service Manager"
       }
@@ -50,7 +49,8 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "licenseFile": "../LICENSE"
   },
   "identifier": "com.pdrakeweb.llm-manager",
   "productName": "Local LLM Service Manager",
