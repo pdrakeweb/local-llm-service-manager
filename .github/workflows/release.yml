@@ -1,0 +1,50 @@
+name: Release
+
+# Release autobuild: pushing a v* tag builds the Windows NSIS installer and
+# creates the GitHub Release with the bundle attached. tauri-action handles
+# release creation + asset upload when it runs on a tag push.
+#
+# NOTE: no updater artifacts in v1 — tauri-plugin-updater is not wired up,
+# so no updater JSON is produced or expected (see spec §12).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install UI dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Build installer and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: src-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Local LLM Service Manager ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
