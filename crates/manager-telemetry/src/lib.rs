@@ -1,20 +1,37 @@
 //! GPU telemetry (spec §5).
 //!
-//! Primary source: `nvml-wrapper` (device handles, per-process accounting).
-//! Load-bearing fallback: `nvidia-smi --query --xml` parsed on NVML init
-//! failure or per-GPU handle failure — the app must start and monitor
-//! correctly with NVML fully unavailable (Pascal-era quirks on the P100s).
-//! The UI shows the source per GPU ("NVML" / "nvidia-smi fallback").
+//! Primary source: NVML (see [`nvml`]) — device handles, per-process
+//! accounting. Load-bearing fallback: `nvidia-smi --query --xml-format`
+//! (see [`smi`]) — parsed on NVML init failure or per-GPU handle failure,
+//! so the app starts and monitors correctly with NVML fully unavailable
+//! (Pascal-era quirks on the P100s). The UI shows the source per GPU
+//! ("NVML" / "nvidia-smi fallback").
 //!
-//! Poll loop: default 1 s cadence, single poller, snapshot store is the
-//! single writer. Affected GPUs are marked STALE after one missed tick
-//! ([`STALE_AFTER_SECS`]); last-known values stay visible, never synthesized.
+//! [`store::TelemetryStore`] is the single-writer snapshot store fed by the
+//! poll loop. GPUs are labeled STALE after [`STALE_AFTER_SECS`] seconds
+//! without a successful poll; last-known values stay visible and are never
+//! synthesized (spec global UI rules).
+
+pub mod nvml;
+pub mod smi;
+pub mod store;
+
+pub use nvml::NvmlSource;
+pub use smi::NvidiaSmiSource;
+pub use store::{
+    FallbackSource, PeakMark, PeakMarks, PollCadence, Poller, TelemetryStore, HISTORY_CAP,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Seconds without a successful poll before a GPU is labeled STALE.
+///
+/// Spec §5 says "after one missed tick" for the poll loop while the global UI
+/// rules (§4) say "older than 10 s"; the crate contract fixes this at 10 s,
+/// which also covers the 5 s cadence without flapping. Resolved in favor of
+/// the contract value.
 pub const STALE_AFTER_SECS: u64 = 10;
 
 /// Which source produced a sample.
@@ -31,9 +48,15 @@ pub struct GpuInfo {
     pub index: u32,
     pub name: String,
     pub uuid: String,
-    /// e.g. (8, 6) for Ampere, (6, 0) for Pascal P100.
+    /// e.g. (8, 6) for Ampere, (6, 0) for Pascal P100. (0, 0) = unknown
+    /// (nvidia-smi XML does not report compute capability; it is mapped
+    /// from known product names where possible).
     pub compute_capability: (u32, u32),
     pub total_vram_mib: u64,
+    /// PCI bus id, e.g. "00000000:65:00.0".
+    pub pci_bus_id: String,
+    /// Driver version string, e.g. "581.57".
+    pub driver_version: String,
     pub source: TelemetrySourceKind,
 }
 
@@ -51,6 +74,59 @@ pub struct GpuSample {
     /// True when no successful poll within [`STALE_AFTER_SECS`].
     pub stale: bool,
     pub source: TelemetrySourceKind,
+    /// Memory-controller utilization %, when reported.
+    pub mem_util_pct: Option<f32>,
+    /// Fan speed %, when reported (P100s have no fan: None).
+    pub fan_pct: Option<f32>,
+    /// Power limit W, when exposed.
+    pub power_limit_w: Option<f32>,
+    /// Graphics clock MHz, when reported.
+    pub clocks_graphics_mhz: Option<u32>,
+    /// Memory clock MHz, when reported.
+    pub clocks_mem_mhz: Option<u32>,
+}
+
+impl GpuSample {
+    /// Derived free VRAM (drives the model fit-check). Never negative:
+    /// clamps at 0 if a driver ever reports used > total.
+    pub fn free_vram_mib(&self) -> u64 {
+        self.vram_total_mib.saturating_sub(self.vram_used_mib)
+    }
+
+    /// Fresh (non-stale) sample stamped now.
+    ///
+    /// Eight parameters mirrors the struct's required fields; this is a
+    /// test/setup convenience constructor, not a general API (production
+    /// code builds samples from source-specific parsers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fresh(
+        index: u32,
+        name: &str,
+        utilization_pct: f32,
+        vram_used_mib: u64,
+        vram_total_mib: u64,
+        temp_c: f32,
+        power_w: f32,
+        source: TelemetrySourceKind,
+    ) -> Self {
+        Self {
+            index,
+            name: name.to_string(),
+            ts: Utc::now(),
+            utilization_pct,
+            vram_used_mib,
+            vram_total_mib,
+            temp_c,
+            power_w,
+            stale: false,
+            source,
+            mem_util_pct: None,
+            fan_pct: None,
+            power_limit_w: None,
+            clocks_graphics_mhz: None,
+            clocks_mem_mhz: None,
+        }
+    }
 }
 
 /// Per-process VRAM attribution (NVML accounting; best-effort on fallback).
@@ -69,77 +145,33 @@ pub trait TelemetrySource: Send + Sync {
     fn kind(&self) -> TelemetrySourceKind;
     async fn sample(&self) -> Result<Vec<GpuSample>, TelemetryError>;
     async fn processes(&self) -> Result<Vec<ProcessSample>, TelemetryError>;
-}
 
-/// NVML-backed source (primary).
-pub struct NvmlSource;
-
-#[async_trait]
-impl TelemetrySource for NvmlSource {
-    fn kind(&self) -> TelemetrySourceKind {
-        TelemetrySourceKind::Nvml
-    }
-    async fn sample(&self) -> Result<Vec<GpuSample>, TelemetryError> {
-        todo!("NVML poll via nvml-wrapper")
-    }
-    async fn processes(&self) -> Result<Vec<ProcessSample>, TelemetryError> {
-        todo!("NVML per-process accounting")
-    }
-}
-
-/// `nvidia-smi --query --xml` source (load-bearing fallback).
-pub struct NvidiaSmiSource {
-    pub nvidia_smi_path: std::path::PathBuf,
-}
-
-impl NvidiaSmiSource {
-    /// Parse `nvidia-smi -q -x` XML output into samples.
-    pub fn parse_xml(xml: &str) -> Result<Vec<GpuSample>, TelemetryError> {
-        let _ = xml;
-        todo!("parse nvidia-smi XML with quick-xml")
+    /// One poll producing both result sets. The default implementation
+    /// makes two calls (kept for sources where a combined query is
+    /// impossible); a failed process query degrades to empty attribution
+    /// rather than failing the tick. Sources that can do it in one shot —
+    /// nvidia-smi is one `nvidia-smi --query --xml-format` spawn — override
+    /// this so a tick costs a single acquisition instead of two.
+    async fn sample_with_processes(
+        &self,
+    ) -> Result<(Vec<GpuSample>, Vec<ProcessSample>), TelemetryError> {
+        let samples = self.sample().await?;
+        let processes = self.processes().await.unwrap_or_default();
+        Ok((samples, processes))
     }
 }
 
-#[async_trait]
-impl TelemetrySource for NvidiaSmiSource {
-    fn kind(&self) -> TelemetrySourceKind {
-        TelemetrySourceKind::NvidiaSmi
-    }
-    async fn sample(&self) -> Result<Vec<GpuSample>, TelemetryError> {
-        todo!("run nvidia-smi -q -x and parse")
-    }
-    async fn processes(&self) -> Result<Vec<ProcessSample>, TelemetryError> {
-        todo!("parse nvidia-smi process list")
-    }
-}
-
-/// In-memory snapshot store: single writer (the poll loop), many readers.
-/// Marks GPUs STALE after [`STALE_AFTER_SECS`] without a successful poll.
-pub struct TelemetryStore {
-    last: Vec<GpuSample>,
-}
-
-impl TelemetryStore {
-    pub fn new() -> Self {
-        todo!("empty telemetry store")
-    }
-
-    /// Record a fresh poll; clears STALE for reported GPUs.
-    pub fn update(&mut self, samples: Vec<GpuSample>) {
-        todo!("store {samples:?}")
-    }
-
-    /// Current snapshot; GPUs older than [`STALE_AFTER_SECS`] are
-    /// returned with `stale: true` and last-known values.
-    pub fn snapshot(&self) -> Vec<GpuSample> {
-        todo!("snapshot with staleness applied")
-    }
-}
-
-impl Default for TelemetryStore {
-    fn default() -> Self {
-        Self { last: Vec::new() }
-    }
+/// The production telemetry stack: NVML primary, `nvidia-smi` fallback.
+///
+/// The fallback is load-bearing, not decorative: on machines where NVML is
+/// unavailable at all — or where per-GPU handles fail, the documented
+/// Pascal/P100 case — every poll transparently comes from `nvidia-smi` and
+/// `FallbackSource::active_kind()` reports `NvidiaSmi` so the UI can show
+/// the per-GPU "nvidia-smi fallback" label (spec §5). This is the default
+/// wiring the app boots with; NVML being unwired on non-Windows builds
+/// (see [`nvml`]) is precisely the case the fallback exists for.
+pub fn default_telemetry_stack() -> FallbackSource<NvmlSource, NvidiaSmiSource> {
+    FallbackSource::new(NvmlSource::new(), NvidiaSmiSource::default())
 }
 
 /// Telemetry errors.
@@ -151,28 +183,4 @@ pub enum TelemetryError {
     SmiFailed(String),
     #[error("XML parse error: {0}")]
     ParseError(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sample_constructs_with_source() {
-        let s = GpuSample {
-            index: 0,
-            name: "NVIDIA RTX A4000".to_string(),
-            ts: Utc::now(),
-            utilization_pct: 12.5,
-            vram_used_mib: 1024,
-            vram_total_mib: 16384,
-            temp_c: 45.0,
-            power_w: 60.0,
-            stale: false,
-            source: TelemetrySourceKind::Nvml,
-        };
-        assert!(!s.stale);
-        assert_eq!(s.source, TelemetrySourceKind::Nvml);
-        assert_eq!(STALE_AFTER_SECS, 10);
-    }
 }

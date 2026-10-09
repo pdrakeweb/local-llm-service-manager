@@ -5,7 +5,7 @@
 | Requirement | Minimum | Notes |
 |---|---|---|
 | Windows | 11 24H2 (build ≥ 26100) | MXC process-container floor |
-| NVIDIA driver | R535 branch or newer | R580 branch (e.g. 581.57 Studio) verified with the Tesla P100 — see the verified matrix below |
+| NVIDIA driver | R550 branch or newer (Windows ≥ 551.61 — the CUDA 12.4 floor per NVIDIA's release notes) | R580 branch (e.g. 581.57 Studio) verified with the Tesla P100 — see the verified matrix below |
 | WebView2 | Evergreen runtime | In-box on Windows 11; the installer checks and offers the bootstrapper if missing |
 | Disk | 120 GB free | 4 GGUF models (~60–90 GB) + llama.cpp builds + headroom |
 | VS Code | Current stable | `code` CLI on PATH; the setup wizard installs the extensions |
@@ -74,6 +74,6 @@ downloaded GGUFs are large and are kept by default.
 | SmartScreen blocks the installer | *More info → Run anyway* (unsigned first releases) |
 | "WebView2 runtime not found" | Accept the bootstrapper offer, or install the Evergreen Standalone Installer from Microsoft |
 | Wizard: "no supported GPU detected" | Update the NVIDIA driver (see matrix above); check Device Manager shows all three cards |
-| Wizard: driver/build mismatch | Update the driver; the pinned cuda-12.4 build requires R535+ |
+| Wizard: driver/build mismatch | Update the driver; the pinned cuda-12.4 build requires R550+ (Windows ≥ 551.61) |
 | Port conflict on `:4000` / `:8081–8084` | The wizard's port check names the conflicting process — stop it or change ports in Settings |
 | Installer won't start | Re-download (partial download); check the SHA-256 on the release page |

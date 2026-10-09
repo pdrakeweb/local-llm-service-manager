@@ -1,6 +1,6 @@
 # Crate map — implementation contract
 
-Rust workspace scaffold for the Local LLM Service Manager. Eight library
+Rust workspace scaffold for the Local LLM Service Manager. Nine library
 crates under `crates/` (workspace members) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
@@ -35,10 +35,51 @@ request_log_len), `ModelGroup` (name, members, strategy, fallbacks),
 
 **Functions (stubs):**
 `load(path: &PathBuf) -> Result<AppConfig, ConfigError>` (migrate, validate,
-fall back to `.bak`); `save(config, path)` (validate, `.bak` rotation);
-`validate(config)` (ports unique/in range, splits sum to 1.0, backend model
-refs exist); `migrate(raw: serde_json::Value)`; `default_config()`
-(implemented); `default_data_dir()` (implemented); `CURRENT_VERSION: u32 = 1`.
+fall back to `.bak`); `load_detailed(path) -> Result<LoadReport, ConfigError>`
+(same, plus `used_backup: bool` so the UI can banner the fallback per spec
+§10); `save(config, path)` (validate, `.bak` rotation);
+`validate(config)` (version == CURRENT_VERSION, ports unique/in range, backend
+ids unique/non-empty/no-`:`, splits sum to 1.0, backend model refs exist —
+compared separator- and case-insensitively); `migrate(raw:
+serde_json::Value)`; `default_config()` (implemented); `default_data_dir()`
+(implemented); `CURRENT_VERSION: u32 = 1`.
+
+`ModelConfig` carries the spec §10 additive fields `source_url: String` and
+`assigned_backends: Vec<String>` (both `#[serde(default)]`, so older files
+without them still deserialize).
+
+**`diff` module (spec §14 `backend_preview_diff` / `backend_apply_config`):**
+`BackendPatch` (all-optional patch struct; `raw_flags: Option<Option<String>>`
+distinguishes untouched/clear), `FieldChange` (field, old, new as JSON),
+`ConfigDiff` (backend_id, changes, valid); `diff_config(backend_id, current,
+patch)` (pure preview); `apply_config_diff(config, backend_id, patch)`
+(applies, re-validates whole config, rolls the backend back on failure).
+
+**`diagnostics` module (spec §14 `diagnostics_export_bundle`):**
+`export_diagnostics(config, log_scopes, telemetry_snapshot_json, versions,
+dest_dir)` — writes `diagnostics-<ms>.zip` (config.json, logs/\<scope\>.log,
+telemetry.json, versions.txt); scope names sanitized against path traversal.
+Takes plain data so this crate does not depend on supervisor/telemetry.
+
+---
+
+## manager-mcp — spec §8
+
+MCP server registry: GitHub + Google Drive (`default_servers()`), modes
+local | remote | disabled. Depends on `manager-supervisor` for lifecycle.
+
+**Types:** `McpMode` (Local|Remote|Disabled), `McpTransport` (Stdio|Http),
+`ServerSpec` (id, name, transport, mode, command/args, env_keys — keys only,
+url, cred_ref — Credential Manager target name only, package),
+`McpServerStatus` (id, name, mode, transport, running, env_keys), `McpError`.
+
+**Functions:** `default_servers()`; `process_id(server_id)` (`"mcp-<id>"`);
+`process_spec_for(server)` (Some only for local stdio; env values injected
+by the caller at spawn); `spawn_local` / `stop_local` (via Supervisor);
+`list_status(supervisor, servers)`; `credential_presence(server, exists)`
+(maps env keys to presence via a caller predicate — values never read);
+`editor_mcp_config(servers)` (`mcpServers` JSON for Continue/Cline; env
+values emitted empty).
 
 ---
 
@@ -48,18 +89,33 @@ Setup wizard step state machine. Ten ordered auto-run steps; audit mode
 re-runs check-type steps without reinstalling.
 
 **Types:** `StepState` (Queued|Running|Done|Failed|Skipped|Manual),
-`RunMode` (Install|Audit), `WizardContext` (config, data_dir, mode),
-`StepOutcome` (state, message, log_tail, duration_ms), `WizardStep` trait
-(async: `id()`, `name()`, `prerequisites() -> &[String]`,
-`is_check()` default false, `planned_commands(ctx)` — must equal spawned
-argv, `run(ctx)`), `PlannedCommand` (argv, cwd, env), `StepReport`,
-`WizardReport` (with `progress() -> (done, total)`), `Wizard` runner,
-`WizardError`.
+`RunMode` (Install|Audit), `WizardContext` (config, data_dir, mode, ops:
+`Arc<dyn SystemOps>` — injectable system effects), `StepOutcome` (state,
+message, log_tail, duration_ms), `WizardStep` trait (async: `id()`,
+`name()`, `prerequisites() -> Vec<String>` — owned; the scaffold draft said
+`&[String]`, evolved during implementation so steps aren't forced to store
+the vec — semantics unchanged, `remediation_hint()` added for audit
+remediation offers, `planned_commands(ctx)` — mode-aware, must equal spawned
+argv (download/http-get/http-post are display conventions, documented on
+`PlannedCommand`), `run(ctx)`), `PlannedCommand` (argv, cwd, env), `StepReport` (+
+message, note), `WizardReport` (with `progress() -> (done, total)` and
+`fraction()`), `Wizard` runner, `WizardError` (incl. `DuplicateStepId`), `SystemOps` trait
+(run_command, spawn_detached, download, extract_zip, http_get, http_post,
+read_file, write_file, file_exists, sha256_file, gpu_inventory,
+credential_exists, home_dir), `RealSystemOps` (production impl, with connect/
+HTTP timeouts), `FakeSystemOps` (hermetic test harness), `GpuDescriptor`,
+`CommandOutput`, `HttpResponse`, `LlamaCppPin` (spec §3.4 cuda-12.4 pin +
+Pascal validation).
 
-**Functions (stubs):** `Wizard::new(steps, mode)`,
+**Functions (stubs):** `Wizard::new(steps, mode) ->
+Result<Wizard, WizardError>` (duplicate step ids rejected, no panic),
 `Wizard::run_all(ctx)` (ordered auto-run, prerequisite-gated),
 `Wizard::run_step(ctx, id)`, `Wizard::retry(id)`, `Wizard::skip(id, note)`,
-`Wizard::mark_manual(id, path, version)`, `Wizard::progress()`.
+`Wizard::mark_manual(id, path, version)`, `Wizard::progress()`,
+`Wizard::get_step(id)` (public step lookup for the "Show commands" UI),
+`steps::continue_editor_config(config)` (Continue `config.json` content,
+shared by the VscodeExtensions step and the Tauri `vscode_write_config`
+command).
 
 ---
 
@@ -74,12 +130,19 @@ exponential capped crash backoff, per-scope stdout/stderr ring buffers.
 (base, max, max_retries) with `delay_for_attempt()` (implemented) and
 `allows_retry()` (implemented), `LogStream` (Stdout|Stderr), `LogRecord`,
 `RingBuffer<T>` (implemented: new/push/len/recent), `SupervisedProcess`,
-`Supervisor`, `SupervisorError`.
+`Supervisor`, `SupervisorError`, `LogLevelFilter` (heuristic level match for
+`logs_query`), `TestResult` (status/content/token usage/latency).
 
 **Functions (stubs):** `SupervisedProcess::spawn(id, program, args, env,
 log_ring)`, `drain(timeout)`, `kill()`; `Supervisor::new(backoff)`,
 `spawn_backend(id)`, `stop(id, graceful)`, `restart(id, graceful)`,
 `launch_argv(id)` — must equal the wizard's `planned_commands` output.
+`Supervisor::logs_query(scope, level, search, limit)` (spec §14: newest-first
+log query over live scopes and retained `dead_rings`; heuristic
+`LogLevelFilter`), `test_request(base_url, prompt)` (spec §14
+`backend_test_request`: minimal `/v1/chat/completions` probe returning
+`TestResult`). Stopped/reaped processes retain their log rings in
+`dead_rings` until the id is spawned again.
 
 ---
 
@@ -95,11 +158,19 @@ last-known values shown, never synthesized. Source shown per GPU in UI.
 vram_total_mib, temp_c, power_w, stale, source), `ProcessSample`
 (pid, name, vram_mib, backend_id), `TelemetrySource` trait
 (async `sample()`, `processes()`), `NvmlSource`, `NvidiaSmiSource`
-(with `parse_xml(&str)` stub), `TelemetryStore`, `TelemetryError`.
+(with `parse_xml(&str)` stub), `TelemetryStore`, `TelemetryError`,
+`PeakMark<T>` (value + timestamp), `PeakMarks` (per-GPU resettable peaks:
+`utilization_pct`, `vram_util_pct`, `vram_used_mib`, `temp_c`,
+`power_w` — each `None` until the first sample raises it).
 
 **Functions (stubs):** `TelemetrySource::sample/processes`,
+`TelemetrySource::sample_with_processes` (default: two calls; overridden by
+`NvidiaSmiSource` and `FallbackSource` for single-acquisition ticks),
 `NvidiaSmiSource::parse_xml`, `TelemetryStore::new/update/snapshot`
-(snapshot applies staleness).
+(snapshot applies staleness), `TelemetryStore::peaks(index)` (peak marks
+with timestamps, shown in the UI), `TelemetryStore::reset_peaks()` (spec §5:
+peak marks are resettable), `default_telemetry_stack()` (NVML primary +
+nvidia-smi fallback; the fallback is the default on machines without NVML).
 
 ---
 
@@ -117,6 +188,14 @@ Reuses `manager_config::{AppConfig, ModelGroup, RoutingStrategy}`.
 `model_entries_for_group(group, config)`,
 `pick_strategy(group, latency_data_available)` (degrade latency-based →
 simple-shuffle when no latency data).
+
+**Routing trace + request ring (spec §14 `gateway_test_routing` /
+`gateway_recent_requests`):** `RoutingDecision` (at, group, backend,
+strategy used after degradation, human-readable reason),
+`trace_routing(group, stats, latency_data_available, seed)` (pure: runs
+`pick_backend` and describes the decision; the caller records it),
+`RoutingLog` (in-memory ring, `ROUTING_LOG_CAP` = 50, `record` /
+`recent` newest-first / `clear`; owned by the Tauri `AppState`).
 
 Group/strategy defaults (spec §7): planner/latency-based → coder →
 openrouter; coder-fast/least-busy → coder → openrouter;
@@ -138,7 +217,22 @@ free_mib}), `ModelError`.
 
 **Functions (stubs):** `download(spec, dest, on_progress)` (HTTP range
 resume), `verify_sha256(path, expected_hex)`,
-`fit_check(spec, free_vram_mib_per_gpu)`.
+`fit_check(spec, free_vram_mib_per_gpu)`, `delete_model_file(model,
+backends)` (guarded delete, spec §14 `model_delete`: refuses with
+`ModelError::InUse` when any backend's `model_file` points at the model's
+`gguf_path` or appears in its `assigned_backends`; otherwise deletes the
+file — a missing file is not an error — and returns `DeleteReport` (id,
+path, file_existed, bytes_freed)).
+
+**`placement` module (spec §14 `placement_propose` / `placement_apply`):**
+`PlacementProjection` (model_id, split, per_gpu_mib, per_gpu_fits, fits,
+verdict), `validate_split(split, n_gpus)`,
+`propose_placement(spec, split, free_vram_mib_per_gpu)` (explicit-split
+projection; allocation = size × fraction rounded up),
+`apply_placement(backend: &mut BackendConfig, split)` (validates, writes
+`flags.tensor_split`; implies `SplitMode::Layer` only when mode is `None` —
+never clobbers an explicit `Row`). Dependency direction: `manager-models`
+→ `manager-config`; `manager-config` never depends back.
 
 ---
 
@@ -159,7 +253,19 @@ policy from the activity report.
 
 **Functions (stubs):** `decide(policy, request)` (default-deny on no match),
 `validate(policy)` (no secrets, absolute paths, ports in range,
-default-deny set, no allow-all), `parse_learning_report(json)`.
+default-deny set, no allow-all), `parse_learning_report(json)`,
+`filter_since(report, since_ms)` (keep entries at/after the cutoff;
+unparseable timestamps kept).
+
+**`self_test` module (spec §4.1 wizard step 9, §14 `mxc_run_self_test`):**
+`self_test(policy) -> Vec<SelfTestCase>` — a fixed set of 12 benign
+(project file read/write, tool-runtime read, loopback gateway/backend,
+GitHub API) and malicious (SSH key read/write, credential-store read,
+Documents read, non-loopback egress, unknown-host HTTP) probes evaluated
+with `decide`; each case carries expected vs actual and `passed`. Harmless
+by construction: pure policy evaluations, nothing executed.
+`self_test_with_env` (explicit `%VAR%` resolver), `summarize_self_test`,
+`ProbeKind` (Benign|Malicious), `SelfTestCase`, `SelfTestSummary`.
 
 ---
 

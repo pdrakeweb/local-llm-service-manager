@@ -3,14 +3,35 @@
 //! Single JSON file at `%APPDATA%\local-llm-service-manager\config.json`
 //! (schema `version: u32`, current [`CURRENT_VERSION`]). Secrets are never
 //! stored here — only credential *references* (Credential Manager target names).
+//!
+//! Loading: parse → [`migrate`] → [`validate`]. If the primary file fails to
+//! parse or validate, the `.bak` last-known-good copy is tried; if that also
+//! fails the primary error is returned. A missing file is an I/O error —
+//! callers fall back to [`AppConfig::default_config`] on first run.
+//!
+//! Saving: [`validate`] first, then rotate the existing file to `.bak`,
+//! then atomic write (temp file + rename).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub mod diagnostics;
+pub mod diff;
+
+pub use diagnostics::export_diagnostics;
+pub use diff::{apply_config_diff, diff_config, BackendPatch, ConfigDiff, FieldChange};
 
 /// Current config schema version.
 pub const CURRENT_VERSION: u32 = 1;
+
+/// Tolerance for tensor_split sum-to-1.0 checks.
+const SPLIT_SUM_EPSILON: f32 = 1e-4;
+
+/// Upper bound for the gateway request ring buffer length.
+const MAX_REQUEST_LOG_LEN: usize = 100_000;
 
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +165,12 @@ pub struct ModelConfig {
     pub params_b: f32,
     pub sha256: String,
     pub verified_at: Option<DateTime<Utc>>,
+    /// Where the file came from (spec §10). Empty for locally-added files.
+    #[serde(default)]
+    pub source_url: String,
+    /// Backend ids this model is assigned to (spec §10).
+    #[serde(default)]
+    pub assigned_backends: Vec<String>,
 }
 
 /// Telemetry polling configuration (spec §5).
@@ -216,16 +243,34 @@ pub enum ConfigError {
     MigrationFailed(String),
     #[error("backup failed: {0}")]
     BackupFailed(String),
+    #[error("diagnostics bundle failed: {0}")]
+    Zip(String),
 }
 
 impl AppConfig {
     /// Sensible first-run defaults matching the spec's port/strategy conventions.
+    ///
+    /// The four conventional backends (planner :8081, coder :8082,
+    /// coder-fast :8083, tool-runner :8084) are present but disabled; the
+    /// wizard enables them as models are downloaded and verified.
     pub fn default_config() -> Self {
         let strategies = [
-            ("planner", RoutingStrategy::LatencyBased, vec!["coder", "openrouter"]),
-            ("coder-fast", RoutingStrategy::LeastBusy, vec!["coder", "openrouter"]),
+            (
+                "planner",
+                RoutingStrategy::LatencyBased,
+                vec!["coder", "openrouter"],
+            ),
+            (
+                "coder-fast",
+                RoutingStrategy::LeastBusy,
+                vec!["coder", "openrouter"],
+            ),
             ("coder", RoutingStrategy::SimpleShuffle, vec!["openrouter"]),
-            ("tool-runner", RoutingStrategy::LeastBusy, vec!["openrouter"]),
+            (
+                "tool-runner",
+                RoutingStrategy::LeastBusy,
+                vec!["openrouter"],
+            ),
         ];
         let groups = strategies
             .into_iter()
@@ -236,11 +281,33 @@ impl AppConfig {
                 fallbacks: fallbacks.into_iter().map(str::to_string).collect(),
             })
             .collect();
+        let backends = ["planner", "coder", "coder-fast", "tool-runner"]
+            .into_iter()
+            .zip([8081u16, 8082, 8083, 8084])
+            .map(|(id, port)| BackendConfig {
+                id: id.to_string(),
+                enabled: false,
+                model_file: PathBuf::from(format!("models/{id}.gguf")),
+                port,
+                flags: ServerFlags {
+                    n_ctx: 32768,
+                    n_batch: 512,
+                    tensor_split: Vec::new(),
+                    split_mode: SplitMode::None,
+                },
+                raw_flags: None,
+                restart_policy: RestartPolicy {
+                    max_retries: 5,
+                    backoff_base_secs: 2,
+                },
+                overrides_global: false,
+            })
+            .collect();
         Self {
             version: CURRENT_VERSION,
             data_dir: default_data_dir(),
             view_modes: HashMap::new(),
-            backends: Vec::new(),
+            backends,
             gateway: GatewayConfig {
                 port: 4000,
                 groups,
@@ -277,25 +344,283 @@ impl AppConfig {
 
 /// Load, migrate, and validate the config at `path`.
 ///
-/// On validation failure, falls back to the `.bak` last-known-good copy.
+/// If the primary file is missing, unreadable, unparsable, or fails
+/// validation, the `.bak` last-known-good copy is tried. If that also fails,
+/// the primary error is returned. A missing file is an I/O error —
+/// callers fall back to [`AppConfig::default_config`] on first run.
+///
+/// Use [`load_detailed`] when the caller needs to know whether the `.bak`
+/// fallback was used (spec §10 requires a UI banner in that case).
 pub fn load(path: &PathBuf) -> Result<AppConfig, ConfigError> {
-    todo!("load config from {path:?}, migrate, validate, fall back to .bak")
+    load_detailed(path).map(|r| r.config)
 }
 
-/// Validate and save the config, keeping a `.bak` of the previous file.
+/// Result of [`load_detailed`].
+#[derive(Debug)]
+pub struct LoadReport {
+    pub config: AppConfig,
+    /// True when the primary file failed and the `.bak` copy was used.
+    /// Spec §10: the UI must banner this condition.
+    pub used_backup: bool,
+}
+
+/// Like [`load`], but also reports whether the `.bak` fallback was used.
+pub fn load_detailed(path: &PathBuf) -> Result<LoadReport, ConfigError> {
+    match load_one(path) {
+        Ok(config) => Ok(LoadReport {
+            config,
+            used_backup: false,
+        }),
+        Err(primary_err) => {
+            let bak = bak_path(path);
+            match load_one(&bak) {
+                Ok(config) => Ok(LoadReport {
+                    config,
+                    used_backup: true,
+                }),
+                Err(_) => Err(primary_err),
+            }
+        }
+    }
+}
+
+/// Validate and save the config.
+///
+/// The existing file (if any) is rotated to `.bak` first; the new file is
+/// written atomically (temp file + rename). The config is validated *before*
+/// anything is written, so a failed save never clobbers the last-known-good
+/// copy.
 pub fn save(config: &AppConfig, path: &PathBuf) -> Result<(), ConfigError> {
-    todo!("validate then save config to {path:?} with .bak rotation")
+    validate(config)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let json = serde_json::to_string_pretty(config)?;
+    if path.exists() {
+        let bak = bak_path(path);
+        replace_file(path, &bak).map_err(|e| {
+            ConfigError::BackupFailed(format!(
+                "could not rotate {} to {}: {e}",
+                path.display(),
+                bak.display()
+            ))
+        })?;
+    }
+    let tmp = tmp_path(path);
+    fs::write(&tmp, json)?;
+    replace_file(&tmp, path)?;
+    Ok(())
 }
 
-/// Structural validation: ports unique and in range, tensor splits sum to 1.0,
-/// model files referenced by backends exist in `models`, etc.
+/// Structural validation. Collects every problem found and reports them
+/// together; returns `Ok(())` only when the config is fully consistent.
+///
+/// Rules: backend ids unique and non-empty; ports (gateway, backends, WinML
+/// when enabled) unique and non-zero; `tensor_split` empty (single GPU) or
+/// elements in [0, 1] summing to 1.0, consistent with `split_mode`; enabled
+/// backends reference a registered model; model ids unique, `sha256` empty
+/// or 64 hex chars; group members are backend ids or `host:port`; fallbacks
+/// are backend ids or `"openrouter"`; group/rule names unique; numeric
+/// ranges sane.
 pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
-    todo!("validate {config:?}")
+    let mut errors: Vec<String> = Vec::new();
+
+    if config.version != CURRENT_VERSION {
+        errors.push(format!(
+            "config version {} != supported version {CURRENT_VERSION}; load it through migrate() first",
+            config.version
+        ));
+    }
+
+    // --- backend ids and flags ---
+    let mut backend_ids: HashSet<String> = HashSet::new();
+    for b in &config.backends {
+        if b.id.trim().is_empty() {
+            errors.push("backend with empty id".to_string());
+        } else if !backend_ids.insert(b.id.clone()) {
+            errors.push(format!("duplicate backend id {:?}", b.id));
+        }
+        // Group member references use "host:port"; a ':' in a backend id
+        // would make the member parser misclassify it.
+        if b.id.contains(':') {
+            errors.push(format!("backend id {:?} must not contain ':'", b.id));
+        }
+        if b.flags.n_ctx == 0 {
+            errors.push(format!("backend {:?}: n_ctx must be > 0", b.id));
+        }
+        if b.flags.n_batch == 0 {
+            errors.push(format!("backend {:?}: n_batch must be > 0", b.id));
+        }
+        validate_split(&b.id, &b.flags, &mut errors);
+        if b.restart_policy.backoff_base_secs == 0 {
+            errors.push(format!("backend {:?}: backoff_base_secs must be > 0", b.id));
+        }
+    }
+
+    // --- ports: gateway, backends, WinML (when enabled) ---
+    let mut ports: HashMap<u16, String> = HashMap::new();
+    let mut claim_port = |port: u16, owner: String| {
+        if port == 0 {
+            errors.push(format!("{owner}: port 0 is invalid"));
+        } else if let Some(prev) = ports.insert(port, owner.clone()) {
+            errors.push(format!("port {port} claimed by both {prev} and {owner}"));
+        }
+    };
+    claim_port(config.gateway.port, "gateway".to_string());
+    for b in &config.backends {
+        claim_port(b.port, format!("backend {:?}", b.id));
+    }
+    if config.winml.enabled {
+        claim_port(config.winml.port, "winml".to_string());
+    }
+
+    // --- model references (enabled backends must point at a registered model) ---
+    let known_models: HashSet<String> = config
+        .models
+        .iter()
+        .map(|m| normalize_path(&m.gguf_path))
+        .collect();
+    for b in &config.backends {
+        if b.enabled && !known_models.contains(&normalize_path(&b.model_file)) {
+            errors.push(format!(
+                "backend {:?}: model_file {:?} is not a registered model",
+                b.id, b.model_file
+            ));
+        }
+    }
+
+    // --- models ---
+    let mut model_ids: HashSet<String> = HashSet::new();
+    for m in &config.models {
+        if m.id.trim().is_empty() {
+            errors.push("model with empty id".to_string());
+        } else if !model_ids.insert(m.id.clone()) {
+            errors.push(format!("duplicate model id {:?}", m.id));
+        }
+        if m.gguf_path.as_os_str().is_empty() {
+            errors.push(format!("model {:?}: gguf_path must not be empty", m.id));
+        }
+        if m.params_b.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            errors.push(format!("model {:?}: params_b must be > 0", m.id));
+        }
+        if !m.sha256.is_empty() && !is_hex64(&m.sha256) {
+            errors.push(format!(
+                "model {:?}: sha256 must be empty or 64 hex characters",
+                m.id
+            ));
+        }
+    }
+
+    // --- gateway ---
+    if config.gateway.request_log_len == 0 || config.gateway.request_log_len > MAX_REQUEST_LOG_LEN {
+        errors.push(format!(
+            "gateway.request_log_len {} out of range 1..={}",
+            config.gateway.request_log_len, MAX_REQUEST_LOG_LEN
+        ));
+    }
+    let oc = &config.gateway.openrouter;
+    if !oc.daily_cap_usd.is_finite() || oc.daily_cap_usd < 0.0 {
+        errors.push("gateway.openrouter.daily_cap_usd must be a finite value >= 0".to_string());
+    }
+    let mut group_names: HashSet<String> = HashSet::new();
+    for g in &config.gateway.groups {
+        if g.name.trim().is_empty() {
+            errors.push("model group with empty name".to_string());
+        } else if !group_names.insert(g.name.clone()) {
+            errors.push(format!("duplicate model group {:?}", g.name));
+        }
+        for member in &g.members {
+            match member.rsplit_once(':') {
+                // "host:port" reference — backend ids never contain ':'.
+                Some((host, port_str)) => {
+                    let port_ok = !host.is_empty()
+                        && port_str.parse::<u16>().map(|p| p != 0).unwrap_or(false);
+                    if !port_ok {
+                        errors.push(format!(
+                            "group {:?}: invalid member reference {member:?}",
+                            g.name
+                        ));
+                    }
+                }
+                None => {
+                    if !backend_ids.contains(member) {
+                        errors.push(format!(
+                            "group {:?}: unknown backend member {member:?}",
+                            g.name
+                        ));
+                    }
+                }
+            }
+        }
+        for fb in &g.fallbacks {
+            if fb != "openrouter" && !backend_ids.contains(fb) {
+                errors.push(format!("group {:?}: unknown fallback {fb:?}", g.name));
+            }
+        }
+    }
+    let mut rule_ids: HashSet<String> = HashSet::new();
+    for r in &config.gateway.routing_rules {
+        if !rule_ids.insert(r.id.clone()) {
+            errors.push(format!("duplicate routing rule id {:?}", r.id));
+        }
+    }
+
+    // --- telemetry ---
+    if config.telemetry.retention_secs == 0 {
+        errors.push("telemetry.retention_secs must be > 0".to_string());
+    }
+
+    // --- mxc ---
+    if config.mxc.path.as_os_str().is_empty() {
+        errors.push("mxc.path must not be empty".to_string());
+    }
+
+    // --- winml ---
+    if config.winml.enabled {
+        match &config.winml.model_id {
+            Some(id) if !id.trim().is_empty() => {}
+            _ => errors.push("winml is enabled but model_id is not set".to_string()),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::Validation(errors.join("; ")))
+    }
 }
 
-/// Migrate an older raw JSON config forward to [`CURRENT_VERSION`].
+/// Migrate a raw JSON config value forward to [`CURRENT_VERSION`].
+///
+/// Version detection: the `version` key, defaulting to 0 when absent (v0 =
+/// pre-versioned configs). v0 → v1 overlays the stored values onto current
+/// defaults so newly added fields get sane values, then stamps `version: 1`.
+/// Unknown fields are ignored. A version newer than [`CURRENT_VERSION`] or a
+/// non-object root is a [`ConfigError::MigrationFailed`].
 pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
-    todo!("migrate config version in {raw}")
+    if !raw.is_object() {
+        return Err(ConfigError::MigrationFailed(
+            "config root must be a JSON object".to_string(),
+        ));
+    }
+    let version = raw.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    if version > CURRENT_VERSION {
+        return Err(ConfigError::MigrationFailed(format!(
+            "config version {version} is newer than supported version {CURRENT_VERSION}"
+        )));
+    }
+    let mut merged = raw;
+    apply_defaults(&mut merged)?;
+    if version != CURRENT_VERSION {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::json!(CURRENT_VERSION));
+        }
+    }
+    serde_json::from_value(merged).map_err(|e| {
+        ConfigError::MigrationFailed(format!("migrated config failed schema check: {e}"))
+    })
 }
 
 /// Default data directory: `%APPDATA%\local-llm-service-manager`
@@ -310,9 +635,156 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// internals
+// ---------------------------------------------------------------------------
+
+fn load_one(path: &PathBuf) -> Result<AppConfig, ConfigError> {
+    let data = fs::read(path)?;
+    let raw: serde_json::Value = serde_json::from_slice(&data)?;
+    let cfg = migrate(raw)?;
+    validate(&cfg).map_err(|e| match e {
+        ConfigError::Validation(msg) => {
+            ConfigError::Validation(format!("{}: {msg}", path.display()))
+        }
+        other => other,
+    })?;
+    Ok(cfg)
+}
+
+/// Deep-merge `raw` over the current defaults: stored values win, missing
+/// keys are filled from [`AppConfig::default_config`].
+fn apply_defaults(raw: &mut serde_json::Value) -> Result<(), ConfigError> {
+    let defaults = serde_json::to_value(AppConfig::default_config()).map_err(|e| {
+        ConfigError::MigrationFailed(format!("default config failed to serialize: {e}"))
+    })?;
+    let merged = deep_merge(defaults, raw.take());
+    *raw = merged;
+    Ok(())
+}
+
+fn deep_merge(base: serde_json::Value, over: serde_json::Value) -> serde_json::Value {
+    match (base, over) {
+        (serde_json::Value::Object(mut b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                let merged = match b.remove(&k) {
+                    Some(bv) => deep_merge(bv, v),
+                    None => v,
+                };
+                b.insert(k, merged);
+            }
+            serde_json::Value::Object(b)
+        }
+        // Arrays and scalars: the stored value wins wholesale.
+        (_, over) => over,
+    }
+}
+
+fn validate_split(backend_id: &str, flags: &ServerFlags, errors: &mut Vec<String>) {
+    let split = &flags.tensor_split;
+    if split.is_empty() {
+        if flags.split_mode != SplitMode::None {
+            errors.push(format!(
+                "backend {backend_id:?}: split_mode is {:?} but tensor_split is empty",
+                flags.split_mode
+            ));
+        }
+        return;
+    }
+    if flags.split_mode == SplitMode::None {
+        errors.push(format!(
+            "backend {backend_id:?}: tensor_split is set but split_mode is none"
+        ));
+    }
+    for (i, v) in split.iter().enumerate() {
+        if !v.is_finite() || *v < 0.0 || *v > 1.0 {
+            errors.push(format!(
+                "backend {backend_id:?}: tensor_split[{i}] = {v} out of range [0, 1]"
+            ));
+        }
+    }
+    let sum: f32 = split.iter().sum();
+    if (sum - 1.0).abs() > SPLIT_SUM_EPSILON {
+        errors.push(format!(
+            "backend {backend_id:?}: tensor_split sums to {sum}, expected 1.0"
+        ));
+    }
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Separator- and case-insensitive path comparison for model registry
+/// lookups (Windows paths are case-insensitive).
+fn normalize_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn bak_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".bak");
+    PathBuf::from(s)
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Move `src` onto `dst`, replacing `dst` (portable across Windows/POSIX —
+/// `fs::rename` alone does not replace on Windows).
+fn replace_file(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+    if dst.exists() {
+        fs::remove_file(dst)?;
+    }
+    fs::rename(src, dst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_tmpdir(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "manager-config-unit-{}-{}",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Config with one registered model and one enabled backend using it.
+    fn working_config() -> AppConfig {
+        let mut cfg = AppConfig::default_config();
+        cfg.models.push(ModelConfig {
+            id: "qwen3-8b".to_string(),
+            gguf_path: PathBuf::from("models/qwen3-8b.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 8.0,
+            sha256: "ab".repeat(32),
+            verified_at: None,
+            source_url: "https://example.com/qwen3-8b.gguf".to_string(),
+            assigned_backends: vec!["tool-runner".to_string()],
+        });
+        let backend = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap();
+        backend.enabled = true;
+        backend.model_file = PathBuf::from("models/qwen3-8b.gguf");
+        backend.flags.tensor_split = vec![0.6, 0.4];
+        backend.flags.split_mode = SplitMode::Layer;
+        cfg
+    }
 
     #[test]
     fn default_config_round_trips() {
@@ -323,6 +795,359 @@ mod tests {
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: AppConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.version, CURRENT_VERSION);
-        assert_eq!(back.gateway.groups[0].strategy, RoutingStrategy::LatencyBased);
+        assert_eq!(
+            back.gateway.groups[0].strategy,
+            RoutingStrategy::LatencyBased
+        );
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        validate(&AppConfig::default_config()).expect("defaults must validate");
+    }
+
+    #[test]
+    fn working_config_is_valid() {
+        validate(&working_config()).expect("working config must validate");
+    }
+
+    #[test]
+    fn duplicate_backend_ports_rejected() {
+        let mut cfg = working_config();
+        cfg.backends[1].port = cfg.backends[0].port;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("claimed by both"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn gateway_port_collision_rejected() {
+        let mut cfg = working_config();
+        cfg.backends[0].port = cfg.gateway.port;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("claimed by both"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn zero_port_rejected() {
+        let mut cfg = working_config();
+        cfg.backends[0].port = 0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("port 0 is invalid"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn winml_port_collision_rejected_when_enabled() {
+        let mut cfg = working_config();
+        cfg.winml.enabled = true;
+        cfg.winml.model_id = Some("qwen3-8b".to_string());
+        cfg.winml.port = cfg.gateway.port;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("claimed by both"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn winml_port_not_claimed_when_disabled() {
+        let mut cfg = working_config();
+        // 8090 free for a backend while winml is disabled.
+        cfg.backends[0].port = 8090;
+        validate(&cfg).expect("disabled winml must not claim its port");
+    }
+
+    #[test]
+    fn tensor_split_must_sum_to_one() {
+        let mut cfg = working_config();
+        let b = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap();
+        b.flags.tensor_split = vec![0.5, 0.4];
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("sums to 0.9"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn tensor_split_empty_is_ok() {
+        let cfg = working_config();
+        let b = cfg.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert!(b.flags.tensor_split.is_empty());
+        validate(&cfg).expect("empty split must validate");
+    }
+
+    #[test]
+    fn tensor_split_rejects_negative_and_over_one() {
+        let mut cfg = working_config();
+        let b = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap();
+        b.flags.tensor_split = vec![-0.2, 1.2];
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("out of range [0, 1]"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn split_mode_mismatch_rejected() {
+        // Mode set but no split values.
+        let mut cfg = working_config();
+        let b = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
+        b.flags.split_mode = SplitMode::Layer;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("tensor_split is empty"), "unexpected: {err}");
+
+        // Split values but mode none.
+        let mut cfg = working_config();
+        let b = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap();
+        b.flags.split_mode = SplitMode::None;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("split_mode is none"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn enabled_backend_unknown_model_rejected() {
+        let mut cfg = working_config();
+        let b = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap();
+        b.model_file = PathBuf::from("models/does-not-exist.gguf");
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("not a registered model"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn disabled_backend_unknown_model_ok() {
+        let cfg = working_config();
+        // planner is disabled with a placeholder model path.
+        let b = cfg.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert!(!b.enabled);
+        validate(&cfg).expect("disabled backend with placeholder model must validate");
+    }
+
+    #[test]
+    fn duplicate_backend_ids_rejected() {
+        let mut cfg = working_config();
+        let mut dup = cfg.backends[0].clone();
+        dup.port = 18081;
+        cfg.backends.push(dup);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate backend id"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn model_sha256_rules() {
+        // Malformed hash rejected.
+        let mut cfg = working_config();
+        cfg.models[0].sha256 = "not-a-hash".to_string();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("sha256"), "unexpected: {err}");
+
+        // Empty hash (unverified model) is fine.
+        let mut cfg = working_config();
+        cfg.models[0].sha256 = String::new();
+        validate(&cfg).expect("empty sha256 must validate");
+    }
+
+    #[test]
+    fn duplicate_model_ids_rejected() {
+        let mut cfg = working_config();
+        let dup = cfg.models[0].clone();
+        cfg.models.push(dup);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate model id"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn zero_n_ctx_rejected() {
+        let mut cfg = working_config();
+        cfg.backends[0].flags.n_ctx = 0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("n_ctx"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn unknown_group_member_rejected() {
+        let mut cfg = working_config();
+        cfg.gateway.groups[0].members = vec!["nope".to_string()];
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("unknown backend member"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn host_port_member_accepted() {
+        let mut cfg = working_config();
+        cfg.gateway.groups[0].members = vec!["127.0.0.1:18081".to_string()];
+        validate(&cfg).expect("host:port member must validate");
+    }
+
+    #[test]
+    fn malformed_host_port_member_rejected() {
+        let mut cfg = working_config();
+        cfg.gateway.groups[0].members = vec!["127.0.0.1:notaport".to_string()];
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid member reference"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_fallback_rejected_but_openrouter_ok() {
+        let mut cfg = working_config();
+        cfg.gateway.groups[0].fallbacks = vec!["nope".to_string()];
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("unknown fallback"), "unexpected: {err}");
+
+        let mut cfg = working_config();
+        cfg.gateway.groups[0].fallbacks = vec!["openrouter".to_string()];
+        validate(&cfg).expect("openrouter fallback must validate");
+    }
+
+    #[test]
+    fn duplicate_group_names_rejected() {
+        let mut cfg = working_config();
+        let dup = cfg.gateway.groups[0].clone();
+        cfg.gateway.groups.push(dup);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate model group"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn negative_daily_cap_rejected() {
+        let mut cfg = working_config();
+        cfg.gateway.openrouter.daily_cap_usd = -1.0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("daily_cap_usd"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn winml_enabled_without_model_id_rejected() {
+        let mut cfg = working_config();
+        cfg.winml.enabled = true;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("model_id is not set"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn request_log_len_bounds() {
+        let mut cfg = working_config();
+        cfg.gateway.request_log_len = 0;
+        assert!(validate(&cfg).is_err());
+        let mut cfg = working_config();
+        cfg.gateway.request_log_len = MAX_REQUEST_LOG_LEN + 1;
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn retention_secs_zero_rejected() {
+        let mut cfg = working_config();
+        cfg.telemetry.retention_secs = 0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("retention_secs"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn migrate_v0_without_version_key() {
+        // v0: no "version" key, partial fields.
+        let raw = serde_json::json!({
+            "data_dir": "/tmp/llm-test",
+            "gateway": { "port": 4000 },
+            "telemetry": { "poll_interval_ms": 500 }
+        });
+        let cfg = migrate(raw).expect("v0 must migrate");
+        assert_eq!(cfg.version, CURRENT_VERSION);
+        assert_eq!(cfg.gateway.port, 4000);
+        // New-in-v1 fields filled from defaults.
+        assert_eq!(cfg.gateway.request_log_len, 100);
+        assert_eq!(cfg.telemetry.poll_interval_ms, 500);
+        assert_eq!(cfg.telemetry.retention_secs, 60);
+        assert_eq!(cfg.gateway.groups.len(), 4);
+        validate(&cfg).expect("migrated config must validate");
+    }
+
+    #[test]
+    fn migrate_current_version_passthrough() {
+        let raw = serde_json::to_value(working_config()).unwrap();
+        let cfg = migrate(raw).expect("v1 must pass through");
+        assert_eq!(cfg.version, CURRENT_VERSION);
+        assert_eq!(cfg.backends.len(), 4);
+    }
+
+    #[test]
+    fn migrate_future_version_rejected() {
+        let raw = serde_json::json!({ "version": CURRENT_VERSION + 1 });
+        let err = migrate(raw).unwrap_err().to_string();
+        assert!(err.contains("newer than supported"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn migrate_non_object_rejected() {
+        let err = migrate(serde_json::json!([1, 2, 3])).unwrap_err();
+        assert!(matches!(err, ConfigError::MigrationFailed(_)));
+    }
+
+    #[test]
+    fn migrate_ignores_unknown_fields() {
+        let mut raw = serde_json::to_value(working_config()).unwrap();
+        raw["some_future_field"] = serde_json::json!({ "nested": true });
+        raw["backends"][0]["another_future_field"] = serde_json::json!(42);
+        let cfg = migrate(raw).expect("unknown fields must be ignored");
+        assert_eq!(cfg.version, CURRENT_VERSION);
+        validate(&cfg).expect("must still validate");
+    }
+
+    #[test]
+    fn save_validates_before_writing() {
+        let dir = unique_tmpdir("save-invalid");
+        let path = dir.join("config.json");
+        let mut cfg = working_config();
+        cfg.backends[0].port = cfg.backends[1].port; // invalid
+        let err = save(&cfg, &path).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(!path.exists(), "invalid config must not be written");
+    }
+
+    #[test]
+    fn load_missing_file_is_io_error() {
+        let dir = unique_tmpdir("load-missing");
+        let err = load(&dir.join("nope.json")).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)), "unexpected: {err}");
+    }
+
+    #[test]
+    fn backend_id_with_colon_rejected() {
+        // Group member references use "host:port"; a backend id containing
+        // ':' would be misclassified by the member parser.
+        let mut cfg = working_config();
+        cfg.backends[0].id = "weird:name".to_string();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("must not contain ':'"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn version_mismatch_rejected() {
+        let mut cfg = working_config();
+        cfg.version = CURRENT_VERSION + 1;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("config version"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn model_path_match_is_case_and_separator_insensitive() {
+        // Windows paths are case-insensitive; backslashes equal slashes.
+        let mut cfg = working_config();
+        let b = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap();
+        b.model_file = PathBuf::from("MODELS\\QWEN3-8B.GGUF");
+        validate(&cfg).expect("case/separator-insensitive match must validate");
     }
 }

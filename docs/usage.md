@@ -53,24 +53,36 @@ it never reinstalls unprompted.
   (simple-shuffle, least-busy, latency-based), OpenRouter cloud tier and
   fallback policy.
 - **Settings / MXC** — application settings, MXC policy editor with
-  Learning-mode activity reports, credential references, update checks.
+  Learning-mode activity reports, credential references, per-component
+  pin and auto-update toggles. (Update *checking* and *applying* are not in
+  v0.1.0 — see "Updates" below.)
 
 ## Daily workflow
 
 1. Glance at the Dashboard: all services green, GPUs nominal.
 2. After a Learning-mode period, review the MXC activity report and tighten
    the policy (Settings / MXC).
-3. Model updates appear in Models with changelogs; updating re-runs the
-   checksum and a smoke test automatically.
+3. Model downloads, checksum verification, and VRAM fit checks live in Models.
+   Re-downloading a newer GGUF revision is manual in v0.1.0 (automated update
+   checks land in a later release — see "Updates" below).
 4. Anything looks wrong → Logs filtered to the service, or Re-run audit for
    a full verification pass.
+
+## Updates
+
+v0.1.0 tracks per-component pins and auto-update toggles (llama.cpp build,
+LiteLLM, each GGUF, VS Code extensions, MXC runtime/schema, GPU driver), but
+does **not** check for or apply updates yet — "Check now" and per-row Update
+arrive with the P6 updates phase (staged build swap with smoke validation,
+per spec §12). The UI reports this explicitly rather than claiming a check
+happened.
 
 ## Where things live
 
 - Application: `%LOCALAPPDATA%\Local LLM Service Manager`
-- Config and logs: `%APPDATA%\llm-manager`
-- Models: `%APPDATA%\llm-manager\models` (configurable in Settings)
-- llama.cpp builds: `%APPDATA%\llm-manager\bin`
+- Config and logs: `%APPDATA%\local-llm-service-manager`
+- Models: `%APPDATA%\local-llm-service-manager\models` (configurable in Settings)
+- llama.cpp builds: `%APPDATA%\local-llm-service-manager\bin`
 
 ## Troubleshooting
 
@@ -80,5 +92,5 @@ it never reinstalls unprompted.
 | GPU shows STALE | Telemetry lost the GPU — check `nvidia-smi` in a terminal; reseat/driver issue if absent there too |
 | Slow responses | Backend detail latency chart; check queue depth and whether the OpenRouter tier is absorbing overflow (Gateway) |
 | Tool calls blocked unexpectedly | Settings / MXC → recent decisions; Learning-mode report shows what the policy saw |
-| Config corrupted | `%APPDATA%\llm-manager\config.json` is versioned with automatic backup on migration; restore from `config.json.bak` |
+| Config corrupted | `%APPDATA%\local-llm-service-manager\config.json` is versioned with automatic backup on migration; restore from `config.json.bak` |
 | Everything is green but answers are wrong | Backend detail → Test-request tab: bypasses routing and hits the backend directly |

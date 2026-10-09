@@ -54,7 +54,10 @@ execution.
 - **Serving:** standalone `llama-server` (CUDA build) subprocesses, one per backend.
 - **Gateway:** LiteLLM in an app-managed Python environment (uv), config generated
   from app state.
-- **Telemetry:** `nvml-wrapper` primary, `nvidia-smi --query --xml` fallback parser.
+- **Telemetry:** `nvidia-smi --query --xml` parser as the active v1 source, behind a
+  `TelemetrySource` trait seam; NVML runtime loading (`nvml.dll`) is a
+  documented follow-up (see §5). The trait boundary means no caller changes
+  when NVML wiring lands.
 - **Sandboxing:** `mxc-sdk` Rust crate; `wxc-exec.exe` CLI fallback.
 - **Installer:** `tauri-bundler` NSIS target; MSI retained as an option.
   `tauri-plugin-updater` for app self-update.
@@ -87,7 +90,7 @@ The app supervises child processes; it never embeds inference.
 │ Rust backend                                                     │
 │  ┌────────────┐ ┌───────────┐ ┌──────────┐ ┌──────────────────┐   │
 │  │ Supervisor │ │ Telemetry │ │ Downloads│ │ Config store     │   │
-│  │ (llama-    │ │ (NVML +   │ │ (GGUF,   │ │ (serde-typed,    │   │
+│  │ (llama-    │ │ (nvidia-  │ │ (GGUF,   │ │ (serde-typed,    │   │
 │  │  server ×4,│ │ nvidia-smi│ │ builds)  │ │ versioned)       │   │
 │  │ LiteLLM,   │ │ poll loop │ │          │ │                  │   │
 │  │ MCP, WinML)│ │           │ │          │ │                  │   │
@@ -103,7 +106,7 @@ The app supervises child processes; it never embeds inference.
 ┌──────────────────────────────▼──────────────────────────────────┐
 │ OS / hardware                                                    │
 │  llama-server :8081-:8084 │ LiteLLM :4000 │ WinMLServer :8090     │
-│  RTX A4000 + 2× Tesla P100 (NVML) │ Windows Credential Manager   │
+│  RTX A4000 + 2× Tesla P100 (nvidia-smi) │ Windows Credential Manager │
 │  MXC processcontainer runtime │ VS Code (`code` CLI)            │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -114,7 +117,7 @@ per MXC policy.
 
 ### 2.4 Data flow
 
-- Telemetry loop (Rust, 1 s default): NVML poll → in-memory snapshot store →
+- Telemetry loop (Rust, 1 s default): `nvidia-smi` poll → in-memory snapshot store →
   `telemetry-tick` event to UI (full snapshot at 1 s; UI downsamples for sparklines).
 - Log bus: every supervised process gets a scoped ring buffer (default 10k lines);
   `log-line` events stream to UI; UI filters locally.
@@ -131,7 +134,7 @@ per MXC policy.
 | Requirement | Minimum | Verified by |
 |---|---|---|
 | Windows 11 | 24H2, build ≥ 26100.9278 | Wizard prerequisites (MXC processcontainer floor) |
-| NVIDIA driver | Version supporting the pinned llama.cpp CUDA build (see §12) | NVML driver query vs pinned minimum |
+| NVIDIA driver | Version supporting the pinned llama.cpp CUDA build (see §12) | `nvidia-smi` driver query vs pinned minimum |
 | CUDA | CUDA-enabled llama.cpp build; toolkit install optional (build ships its own runtime where possible) | Wizard check: `nvidia-smi` present, driver ≥ minimum |
 | WebView2 | In-box on Win11 | Wizard check; bootstrapper fallback |
 | Disk | ≥ 120 GB free (4 GGUFs ~60–90 GB + builds + headroom) | Wizard disk-space check |
@@ -141,7 +144,9 @@ per MXC policy.
 ### 3.2 Hardware assumptions
 
 RTX A4000 16 GB (primary, planner) + 2× Tesla P100 16 GB (coder pool). The app
-must not assume exactly this: GPU inventory is discovered via NVML at runtime and
+must not assume exactly this: GPU inventory is discovered at runtime (v1:
+`nvidia-smi` XML; the NVML path is behind the `TelemetrySource` trait seam)
+and
 all placement math is computed from discovered VRAM. The P100s are Pascal
 (sm_60); the compatibility matrix is verified, not assumed — see §3.4. The
 wizard fails closed if the pinned build's minimum compute capability exceeds a
@@ -169,8 +174,10 @@ The P100 compatibility question is settled — this is a pinned constraint, not 
 | A4000 alongside | The A4000 is Ampere (sm_86), fully supported under CUDA 12.x — one pinned cuda-12.4 build serves all three GPUs. |
 | Fallbacks | If upstream ever drops the cuda-12.4 assets: community dual-track builds (e.g. kodx/llama.cpp-cuda, unsloth `cuda12-legacy` bundle) publish explicit cuda-12 legacy binaries covering sm_60【5652994368314682905†L92-L95】. Last resort: source build with CUDA 12.x toolkit and `-DCMAKE_CUDA_ARCHITECTURES=60` (prebuilt preferred — Windows nvcc/CMake toolchain pairings are fragile). |
 
-Wizard consequences: the driver check accepts any R535+ branch carrying the P100;
-the build check pins cuda-12.4 assets by SHA-256 and rejects cuda-13.x assets on a
+Wizard consequences: the driver check requires R550+ (Windows driver >= 551.61,
+per NVIDIA's CUDA 12.4 release notes) on any machine that will run the pinned
+cuda-12.4 build; the build check pins cuda-12.4 assets by SHA-256 and rejects
+cuda-13.x assets on a
 Pascal-bearing machine; the smoke test (§4.1 step 10) runs on both the A4000 and a
 P100 backend so a bad pin is caught at install time, not at first use.
 
@@ -302,6 +309,22 @@ Tabs: Catalog | Installed | Downloads.
   on VRAM-change events and explains changes ("P100-1 now holds coder-7b, 6.2 GB
   less free"). Row click → detail pane: role in plan, recommended placement,
   recommended flags, source URL + checksum.
+- **Curated artifacts (v0.1.0).** All Q4_K_M from Qwen's official GGUF repos;
+  the planner slot keeps the spec display name "Qwen3.8-27B" and ships pointed
+  at the closest real artifact, Qwen3-32B (dense 32B-class):
+
+  | Slot | Display name | Artifact repo | File |
+  |---|---|---|---|
+  | planner | Qwen3.8-27B | `Qwen/Qwen3-32B-GGUF` | `Qwen3-32B-Q4_K_M.gguf` |
+  | coder | Qwen3-Coder-30B | `Qwen/Qwen3-Coder-30B-GGUF` | `Qwen3-Coder-30B-Q4_K_M.gguf` |
+  | coder-fast | Qwen2.5-Coder-7B | `Qwen/Qwen2.5-Coder-7B-Instruct-GGUF` | `qwen2.5-coder-7b-instruct-q4_k_m.gguf` |
+  | tool-runner | Qwen3-8B | `Qwen/Qwen3-8B-GGUF` | `Qwen3-8B-Q4_K_M.gguf` |
+
+  Sizes in the catalog are Q4_K_M estimates for fit-check projection only.
+  SHA-256 values ship as `PLACEHOLDER-pin-real-sha256-at-install-time`: the
+  wizard confirms each URL and pins the real hash into the config at install
+  time, and checksum verification fails closed on the placeholder — a model
+  can never be marked "installed" against an unpinned hash.
 - **Installed:** per-GGUF rows — size, quant, checksum-verified date, assigned
   backend(s); actions: Load into backend (picker), Verify checksum, Reveal in
   Explorer, Delete (guarded if a backend references the file).
@@ -377,11 +400,12 @@ Editor & MCP | Windows ML | Updates | Diagnostics.
 
 ## 5. GPU telemetry
 
-**Sources.** Primary: `nvml-wrapper` (device handles, per-process accounting).
-Fallback: `nvidia-smi --query --xml` parsed on NVML init failure or per-GPU
-handle failure. The fallback is load-bearing for the P100s (Pascal-era NVML
-quirks in TCC/driver modes are documented); the app must start and monitor
-correctly with NVML fully unavailable. Telemetry source per GPU is shown in the
+**Sources (v0.1.0).** Active: `nvidia-smi --query --xml` (device handles,
+per-GPU metrics; per-process attribution is best-effort on this path).
+Deferred: NVML runtime loading (`nvml.dll` via the `TelemetrySource` trait
+seam in `manager-telemetry`) — Pascal-era NVML quirks on the P100s make the
+`smi` path the reliable v1 choice; NVML lands in a hardening pass with no
+caller changes required. Telemetry source per GPU is shown in the
 UI ("NVML" / "nvidia-smi fallback").
 
 **Poll loop (Rust).** Default 1 s cadence, user-selectable 1 s / 5 s / off.
@@ -391,17 +415,17 @@ with the STALE label; never synthesize.
 
 **Metrics per GPU.**
 
-| Metric | NVML | nvidia-smi fallback |
+| Metric | v1: nvidia-smi (active) | NVML (deferred) |
 |---|---|---|
 | Utilization % (graphics/compute) | yes | yes |
 | VRAM used/total, memory util % | yes | yes |
 | Temperature °C + peak mark | yes | yes |
-| Power draw W / limit W | yes | yes (draw; limit where exposed) |
+| Power draw W / limit W | yes (draw; limit where exposed) | yes |
 | Clocks (graphics/memory MHz) | yes | yes |
 | Fan % | yes | yes |
-| Per-process VRAM (PID, name, MiB) | accounting stats | `pmon`-style query |
+| Per-process VRAM (PID, name, MiB) | `pmon`-style query (best-effort) | accounting stats |
 | PCI bus/device/function, driver version | yes | yes |
-| Busiest engine (for the "idle-looking card" rule) | per-engine util | limited — shown only when available |
+| Busiest engine (for the "idle-looking card" rule) | limited — shown only when available | per-engine util |
 
 **Derived state.** Free VRAM per GPU (drives fit-check), peak marks (resettable),
 60 s ring buffers per metric for sparklines (UI downsamples), tensor-split
@@ -758,7 +782,7 @@ pseudocode; exact types derive from §10.
 - **Integration (Rust):** supervisor lifecycle against stub `llama-server`
   (start → healthy → kill → backoff restart → drain); config apply → file +
   restarted argv; download manager vs local HTTP (progress, pause/resume ranges,
-  checksum-failure path); NVML with trait-injected mock + forced `nvidia-smi`
+  checksum-failure path); `TelemetrySource` trait-injected mock + forced `nvidia-smi`
   fallback; MXC policy round-trip in Learning mode on a canary command
   (Windows-only lane).
 - **Tauri boundary:** typed request/response test per command; event-stream shape
@@ -767,10 +791,10 @@ pseudocode; exact types derive from §10.
   first-run wizard to working stack with a small test GGUF; backend restart card
   flow with status transitions + log lines; n_ctx edit → diff preview → applied
   argv. Nightly, screenshot-diffed for layout regressions.
-- **Hardware-in-the-loop (the 7865, on demand, `#[ignore]` in CI):** NVML vs
+- **Hardware-in-the-loop (the 7865, on demand, `#[ignore]` in CI):** nvidia-smi vs
   `nvidia-smi` agreement within tolerance; real tensor-split load of Qwen3-8B
   across A4000+P100, observed-vs-configured split comparison; VRAM accounting
-  reconciles (attributed ≈ NVML used); thermal/power sane under load.
+  reconciles (attributed ≈ reported used); thermal/power sane under load.
 - **UI per view mode:** switcher present exactly where the §4 matrix says;
   per-window persistence across restart; corrupt value → Appliance fallback;
   Console/Topology show identical values to Appliance for the same timestamp;
@@ -794,7 +818,7 @@ Ordered; v1 = phases 0–5. Estimates are sequencing, not commitments.
   + verify, GGUF downloads with resume, LiteLLM env + config gen, extension
   install, MCP registration, Show-commands transparency, manual overrides,
   Re-run audit. Exit: clean-machine run reaches a working stack.
-- **P3 — GPU telemetry + placement.** NVML loop with `nvidia-smi` fallback,
+- **P3 — GPU telemetry + placement.** `nvidia-smi` poll loop (NVML deferred, see §5),
   per-process attribution, peak marks, GPUs window (both views), placement map,
   tensor-split editor with projected-VRAM validation + rolling restart.
   Exit: "where is each model" answered live.
@@ -845,7 +869,7 @@ serving path is solid (P5) — it is the outer layer, not the core.
    is framework-independent so this is reversible late — but charting density
    (sparklines at 1 s cadence across views) should be prototyped early in
    whichever framework to validate the no-VDOM-churn assumption.
-7. **`nvml-wrapper` / `mxc-sdk` crate maturity.** Young crates; pin versions and
+7. **NVML runtime loading / `mxc-sdk` crate maturity.** NVML (`nvml.dll`) loading is deferred to a hardening pass (v1 ships the `nvidia-smi` path behind the `TelemetrySource` trait seam); `mxc-sdk` is young; pin versions and
    keep the fallbacks (`nvidia-smi` XML parse; `wxc-exec.exe --config-base64`)
    as first-class paths with tests, not dead code.
 8. **LiteLLM hot-reload support.** Depends on the pinned version; the app must
