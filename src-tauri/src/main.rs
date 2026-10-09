@@ -19,26 +19,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use manager_config::{
     self, AppConfig, BackendPatch, ComponentUpdate, ConfigDiff, GatewayConfig, MxcMode,
 };
-use manager_gateway;
-use manager_mcp;
 use manager_models::{self, DownloadHandle};
 use manager_mxc::{self, Policy};
 use manager_supervisor::{test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, Supervisor};
 use manager_telemetry::{GpuSample, TelemetryStore};
-use manager_winml;
 use manager_wizard::{
     ops::RealSystemOps,
     steps::{continue_editor_config, default_steps, VscodeExtensions},
-    RunMode, StepOutcome, StepState, SystemOps, Wizard, WizardContext, WizardReport,
+    RunMode, StepOutcome, StepState, Wizard, WizardContext, WizardReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::fmt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
@@ -190,7 +182,7 @@ impl From<manager_winml::WinMlError> for ApiError {
 }
 impl From<manager_mcp::McpError> for ApiError {
     fn from(e: manager_mcp::McpError) -> Self {
-        ApiError::Mcp(format!("{e:?}"));
+        ApiError::Mcp(format!("{e:?}"))
     }
 }
 impl From<std::io::Error> for ApiError {
@@ -214,10 +206,6 @@ fn err(e: ApiError) -> String {
 /// (crate errors, `serde_json::Error`, `std::io::Error`).
 fn jerr<E: Into<ApiError>>(e: E) -> String {
     e.into().to_string()
-}
-
-fn contract_gap(detail: &str) -> String {
-    ApiError::ContractGap(detail.to_string()).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +264,8 @@ pub struct AppState {
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
     /// Every `gateway_test_routing` trace records here.
     routing_log: Mutex<manager_gateway::RoutingLog>,
+    /// WinML secondary-backend registry (stateful single-model rule).
+    winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
 }
 
 impl AppState {
@@ -293,6 +283,7 @@ impl AppState {
             downloads: Mutex::new(HashMap::new()),
             mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
+            winml: OnceCell::new(),
         }
     }
 
@@ -326,6 +317,7 @@ impl AppState {
             config: self.config.read().await.clone(),
             data_dir: self.data_dir.clone(),
             mode,
+            ops: Arc::new(RealSystemOps),
         }
     }
 
@@ -345,6 +337,21 @@ impl AppState {
         self.telemetry
             .get_or_init(|| async { Mutex::new(TelemetryStore::new()) })
             .await
+    }
+
+    /// WinML registry, built lazily with the real HTTP probe transport.
+    /// Transport setup can only fail on local client misconfiguration;
+    /// the error is surfaced to the caller instead of panicking.
+    async fn winml(&self) -> Result<&Mutex<manager_winml::WinMlRegistry>, String> {
+        if let Some(r) = self.winml.get() {
+            return Ok(r);
+        }
+        let transport = manager_winml::ReqwestProbeTransport::new(Duration::from_secs(10))
+            .map_err(|e| format!("winml transport setup failed: {e:?}"))?;
+        Ok(self
+            .winml
+            .get_or_init(|| async { Mutex::new(manager_winml::WinMlRegistry::new(transport)) })
+            .await)
     }
 
     async fn wizard(&self, mode: RunMode) -> &Mutex<Wizard> {
@@ -1157,6 +1164,7 @@ async fn model_verify_checksum(state: State<'_, AppState>, id: String) -> ApiRes
         .find(|m| m.id == id)
         .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
     let ok = manager_models::verify_sha256(&m.gguf_path, &m.sha256)
+        .await
         .map_err(ApiError::from)
         .map_err(jerr)?;
     Ok(json!({ "id": id, "ok": ok }))
@@ -1591,7 +1599,8 @@ async fn vscode_install_extensions(state: State<'_, AppState>) -> ApiResult {
     let mut wizard = Wizard::new(
         vec![Box::new(VscodeExtensions::default())],
         RunMode::Install,
-    );
+    )
+    .map_err(jerr)?;
     let report = wizard.run_all(&ctx).await;
     let (done, total) = report.progress();
     state
@@ -1705,7 +1714,7 @@ async fn mxc_set_mode(state: State<'_, AppState>, mode: MxcMode) -> ApiResult {
 #[tauri::command]
 async fn mxc_run_self_test(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await;
-    let policy = current_mxc_policy(&cfg).map_err(jerr)?;
+    let policy = current_mxc_policy(&cfg)?;
     let cases = manager_mxc::self_test(&policy);
     let summary = manager_mxc::summarize_self_test(&cases);
     Ok(json!({ "cases": cases, "summary": summary }))
@@ -1740,7 +1749,7 @@ async fn mxc_get_activity_report(state: State<'_, AppState>, since_ms: Option<u6
 #[tauri::command]
 async fn mxc_propose_tightening(state: State<'_, AppState>, report: Value) -> ApiResult {
     let cfg = state.config.read().await;
-    let policy = current_mxc_policy(&cfg).map_err(jerr)?;
+    let policy = current_mxc_policy(&cfg)?;
     let text = serde_json::to_string(&report).map_err(jerr)?;
     let parsed = manager_mxc::parse_learning_report(&text)
         .map_err(ApiError::from)
@@ -1756,44 +1765,66 @@ async fn mxc_propose_tightening(state: State<'_, AppState>, report: Value) -> Ap
 /// Probe WinMLServer availability; limits recorded verbatim.
 #[tauri::command]
 async fn winml_probe(state: State<'_, AppState>) -> ApiResult {
-    let _ = state;
-    let limits = manager_winml::probe()
+    let cfg = state.config.read().await;
+    let port = if cfg.winml.port == 0 {
+        manager_winml::DEFAULT_PORT
+    } else {
+        cfg.winml.port
+    };
+    let transport = manager_winml::ReqwestProbeTransport::new(Duration::from_secs(10))
+        .map_err(|e| format!("winml transport setup failed: {e:?}"))?;
+    let report = manager_winml::probe(&transport, &manager_winml::base_url(port))
         .await
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    Ok(serde_json::to_value(limits).map_err(jerr)?)
+    Ok(serde_json::to_value(report).map_err(jerr)?)
 }
 
 /// Register a model with the Windows ML secondary backend.
 #[tauri::command]
 async fn winml_register(state: State<'_, AppState>, model_id: String) -> ApiResult {
-    let cfg = state.config.read().await;
-    let reg = manager_winml::register(&cfg.winml, &model_id)
+    let cfg = state.config.read().await.clone();
+    let size_mib = manager_models::curated_models()
+        .iter()
+        .find(|m| m.id == model_id)
+        .map(|m| m.size_bytes / manager_models::MIB);
+    let opts = manager_winml::RegisterOptions {
+        model_size_mib: size_mib,
+        gpu_selection: manager_winml::GpuSelection::default(),
+    };
+    let registry = state.winml().await?;
+    let mut guard = registry.lock().await;
+    let reg = guard
+        .register(&cfg.winml, &model_id, &opts)
         .await
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    Ok(serde_json::to_value(reg).map_err(jerr)?)
+    let value = serde_json::to_value(reg).map_err(jerr)?;
+    drop(guard);
+    Ok(value)
 }
 
 /// Unregister the Windows ML backend.
 #[tauri::command]
 async fn winml_unregister(state: State<'_, AppState>) -> ApiResult {
-    let _ = state;
-    manager_winml::unregister()
-        .await
-        .map_err(ApiError::from)
-        .map_err(jerr)?;
-    Ok(json!({ "ok": true }))
+    let registry = state.winml().await?;
+    let removed = registry.lock().await.unregister();
+    Ok(json!({ "ok": true, "removed": removed.is_some() }))
 }
 
 /// Registration status plus the researched limits (implemented, no stub).
 #[tauri::command]
 async fn winml_status(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await;
+    let registered = match state.winml().await {
+        Ok(registry) => registry.lock().await.status().cloned(),
+        Err(_) => None,
+    };
     Ok(json!({
         "enabled": cfg.winml.enabled,
         "port": cfg.winml.port,
         "model_id": cfg.winml.model_id,
+        "registered": registered,
         "limits": manager_winml::WinMlLimits::known_limits(),
     }))
 }
@@ -1815,7 +1846,7 @@ async fn updates_check_all(state: State<'_, AppState>) -> ApiResult {
 /// Apply an update. Explicitly deferred: spec §16 puts Updates in P6
 /// (post-v1); per-component pin/auto-update toggles work now.
 #[tauri::command]
-async fn updates_apply(state: State<'_, AppState>, component_id: String) -> ApiResult {
+async fn updates_apply(_state: State<'_, AppState>, component_id: String) -> ApiResult {
     let _ = component_id;
     Err(err(ApiError::Unsupported(
         "Update checking ships in P6; per-component pin/auto-update toggles work now".to_string(),
