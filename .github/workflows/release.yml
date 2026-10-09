@@ -54,3 +54,55 @@ jobs:
           releaseName: "Local LLM Service Manager ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
+
+  # Install-test: download the published installer onto a fresh Windows
+  # runner, silent-install it, verify the payload, launch the app briefly,
+  # then silent-uninstall. Catches installer/config regressions that the
+  # build alone cannot.
+  test-install:
+    needs: release-windows
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download installer from release
+        run: gh release download ${{ github.ref_name }} --pattern "*-setup.exe" --dir installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Silent install
+        run: |
+          $exe = Get-ChildItem installer\*-setup.exe | Select-Object -First 1
+          Write-Host "Installing $($exe.FullName)"
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited with code $($p.ExitCode)" }
+
+      - name: Verify installation
+        run: |
+          $dir = "$env:LOCALAPPDATA\Local LLM Service Manager"
+          if (-not (Test-Path $dir)) {
+            Write-Host "Expected dir missing; LOCALAPPDATA contains:"
+            Get-ChildItem $env:LOCALAPPDATA | Select-Object Name
+            throw "install dir not found: $dir"
+          }
+          $appExe = Get-ChildItem "$dir\*.exe" -Recurse | Where-Object { $_.Name -notlike "*ninstall*" } | Select-Object -First 1
+          if (-not $appExe) { throw "no application exe found under $dir" }
+          Write-Host "Installed app exe: $($appExe.FullName)"
+          echo "APP_EXE=$($appExe.FullName)" >> $env:GITHUB_ENV
+
+      - name: Launch smoke test
+        run: |
+          $p = Start-Process -FilePath "$env:APP_EXE" -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "app exited within 20s with code $($p.ExitCode)" }
+          Write-Host "App stayed alive for 20s (pid $($p.Id))"
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Silent uninstall
+        run: |
+          $un = Get-ChildItem "$env:LOCALAPPDATA\Local LLM Service Manager\uninstall.exe" -Recurse | Select-Object -First 1
+          if (-not $un) { throw "uninstaller not found" }
+          $p = Start-Process -FilePath $un.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstaller exited with code $($p.ExitCode)" }
+          if (Test-Path "$env:LOCALAPPDATA\Local LLM Service Manager") { throw "install dir still present after uninstall" }
+          Write-Host "Uninstall clean"
