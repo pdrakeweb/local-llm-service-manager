@@ -62,6 +62,7 @@ jobs:
   test-install:
     needs: release-windows
     runs-on: windows-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -71,8 +72,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Silent install
+        timeout-minutes: 10
         run: |
           $exe = Get-ChildItem installer\*-setup.exe | Select-Object -First 1
+          # Clear Mark-of-the-Web so SmartScreen doesn't block the unsigned installer
+          Unblock-File -Path $exe.FullName
           Write-Host "Installing $($exe.FullName)"
           $p = Start-Process -FilePath $exe.FullName -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "installer exited with code $($p.ExitCode)" }
